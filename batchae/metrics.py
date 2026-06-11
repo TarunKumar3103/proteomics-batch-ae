@@ -1,114 +1,153 @@
-"""Evaluation metrics and objective scoring."""
+"""Evaluation metrics for real-data batch correction.
+
+Real proteomics data usually has no clean ground truth, so this module avoids
+synthetic-only metrics such as MSE-to-clean. It evaluates whether batch signal is
+reduced while known biological signal is preserved.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+import warnings
 
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, silhouette_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 
-@dataclass(frozen=True)
-class ScoreConfig:
-    min_cell_acc: float = 0.75
-    clean_weight: float = 0.02
-    mse_blowup_factor: float = 1.5
-    bad_score: float = 10.0
-
-
-def _safe_cv(labels: np.ndarray, requested_cv: int = 5) -> int:
-    _, counts = np.unique(labels, return_counts=True)
-    return int(max(2, min(requested_cv, counts.min())))
-
-
-def adversarial_accuracy(X_np: np.ndarray, labels: np.ndarray, cv: int = 5, n_jobs: int = 1, seed: int = 42):
-    """Cross-validated linear classifier accuracy on a representation/corrected data."""
-    X_scaled = StandardScaler().fit_transform(X_np)
+def _safe_cv(labels, requested_cv: int = 5) -> int:
     labels = np.asarray(labels)
-    cv_eff = _safe_cv(labels, cv)
-    splitter = StratifiedKFold(n_splits=cv_eff, shuffle=True, random_state=seed)
-    clf = LogisticRegression(max_iter=5000, solver="lbfgs", random_state=seed, n_jobs=n_jobs)
-    scores = cross_val_score(clf, X_scaled, labels, cv=splitter, scoring="accuracy", n_jobs=n_jobs)
-    return float(scores.mean()), float(scores.std())
+    _, counts = np.unique(labels, return_counts=True)
+    if len(counts) < 2:
+        return 0
+    return max(0, min(int(requested_cv), int(counts.min())))
 
 
-def mse_to_clean(X: np.ndarray, X_clean: np.ndarray) -> float:
-    return float(np.mean((X - X_clean) ** 2))
+def classifier_scores(X: np.ndarray, labels, cv: int = 5, n_jobs: int = 1, random_state: int = 42) -> dict:
+    """Cross-validated linear classifier accuracy and balanced accuracy."""
+    labels = np.asarray(labels).astype(str)
+    le = LabelEncoder()
+    y = le.fit_transform(labels)
+    n_classes = len(le.classes_)
+    cv_eff = _safe_cv(y, cv)
+
+    if n_classes < 2 or cv_eff < 2:
+        return {
+            "accuracy": np.nan,
+            "balanced_accuracy": np.nan,
+            "chance": np.nan,
+            "majority_baseline": np.nan,
+            "n_classes": n_classes,
+            "cv": cv_eff,
+        }
+
+    Xs = StandardScaler().fit_transform(X)
+    clf = LogisticRegression(max_iter=5000, solver="lbfgs", n_jobs=None, random_state=random_state)
+    splitter = StratifiedKFold(n_splits=cv_eff, shuffle=True, random_state=random_state)
+
+    acc = cross_val_score(clf, Xs, y, cv=splitter, scoring="accuracy", n_jobs=n_jobs)
+    bacc = cross_val_score(clf, Xs, y, cv=splitter, scoring="balanced_accuracy", n_jobs=n_jobs)
+
+    counts = np.bincount(y)
+    return {
+        "accuracy": float(np.mean(acc)),
+        "accuracy_std": float(np.std(acc)),
+        "balanced_accuracy": float(np.mean(bacc)),
+        "balanced_accuracy_std": float(np.std(bacc)),
+        "chance": float(1.0 / n_classes),
+        "majority_baseline": float(counts.max() / counts.sum()),
+        "n_classes": n_classes,
+        "cv": cv_eff,
+    }
 
 
-def corr_to_clean(X: np.ndarray, X_clean: np.ndarray) -> float:
-    return float(np.corrcoef(X.flatten(), X_clean.flatten())[0, 1])
+def reconstruction_distortion(X_raw: np.ndarray, X_corr: np.ndarray, M: np.ndarray) -> dict:
+    """Magnitude of correction on originally observed values.
+
+    This is not an accuracy metric. It is a sanity-check to flag methods that
+    erase too much of the original observed signal.
+    """
+    obs = M.astype(bool)
+    if obs.sum() == 0:
+        return {"observed_rmse_change": np.nan, "observed_mae_change": np.nan}
+    diff = X_corr[obs] - X_raw[obs]
+    return {
+        "observed_rmse_change": float(np.sqrt(np.mean(diff ** 2))),
+        "observed_mae_change": float(np.mean(np.abs(diff))),
+    }
+
+
+def pca_silhouette(X: np.ndarray, labels, n_components: int = 10, random_state: int = 42) -> float:
+    labels = np.asarray(labels).astype(str)
+    if len(np.unique(labels)) < 2:
+        return np.nan
+    _, counts = np.unique(labels, return_counts=True)
+    if counts.min() < 2:
+        return np.nan
+    n_components = min(n_components, X.shape[0] - 1, X.shape[1])
+    if n_components < 2:
+        return np.nan
+    coords = PCA(n_components=n_components, random_state=random_state).fit_transform(StandardScaler().fit_transform(X))
+    try:
+        return float(silhouette_score(coords, labels))
+    except Exception:
+        return np.nan
 
 
 def evaluate_correction(
+    name: str,
     X_raw: np.ndarray,
-    X_corrected: np.ndarray,
+    X_corr: np.ndarray,
+    M: np.ndarray,
     meta: pd.DataFrame,
-    X_clean: np.ndarray | None = None,
+    batch_col: str = "batch",
+    biology_col: str = "biology",
     cv: int = 5,
     n_jobs: int = 1,
-    seed: int = 42,
-) -> dict[str, Any]:
-    batch_labels = meta["batch"].values
-    cell_labels = meta["cell_line"].values
-    chance = 1.0 / meta["batch"].nunique()
+    random_state: int = 42,
+) -> dict:
+    """Evaluate one corrected matrix against raw data."""
+    out: dict[str, float | str] = {"method": name}
 
-    raw_b, raw_b_std = adversarial_accuracy(X_raw, batch_labels, cv=cv, n_jobs=n_jobs, seed=seed)
-    cor_b, cor_b_std = adversarial_accuracy(X_corrected, batch_labels, cv=cv, n_jobs=n_jobs, seed=seed)
-    raw_cl, raw_cl_std = adversarial_accuracy(X_raw, cell_labels, cv=cv, n_jobs=n_jobs, seed=seed)
-    cor_cl, cor_cl_std = adversarial_accuracy(X_corrected, cell_labels, cv=cv, n_jobs=n_jobs, seed=seed)
+    raw_batch = classifier_scores(X_raw, meta[batch_col].values, cv=cv, n_jobs=n_jobs, random_state=random_state)
+    cor_batch = classifier_scores(X_corr, meta[batch_col].values, cv=cv, n_jobs=n_jobs, random_state=random_state)
+    out.update({f"raw_batch_{k}": v for k, v in raw_batch.items()})
+    out.update({f"corr_batch_{k}": v for k, v in cor_batch.items()})
 
-    out: dict[str, Any] = {
-        "raw_batch": raw_b,
-        "raw_batch_std": raw_b_std,
-        "corr_batch": cor_b,
-        "corr_batch_std": cor_b_std,
-        "chance": chance,
-        "raw_cellline": raw_cl,
-        "raw_cellline_std": raw_cl_std,
-        "corr_cellline": cor_cl,
-        "corr_cellline_std": cor_cl_std,
-    }
+    if biology_col in meta.columns and meta[biology_col].nunique() >= 2:
+        raw_bio = classifier_scores(X_raw, meta[biology_col].values, cv=cv, n_jobs=n_jobs, random_state=random_state)
+        cor_bio = classifier_scores(X_corr, meta[biology_col].values, cv=cv, n_jobs=n_jobs, random_state=random_state)
+        out.update({f"raw_biology_{k}": v for k, v in raw_bio.items()})
+        out.update({f"corr_biology_{k}": v for k, v in cor_bio.items()})
+        out["raw_biology_silhouette"] = pca_silhouette(X_raw, meta[biology_col].values, random_state=random_state)
+        out["corr_biology_silhouette"] = pca_silhouette(X_corr, meta[biology_col].values, random_state=random_state)
+    else:
+        warnings.warn("Biology column missing or has <2 classes; biology preservation metrics skipped.")
 
-    if X_clean is not None:
-        out.update(
-            {
-                "raw_mse": mse_to_clean(X_raw, X_clean),
-                "corr_mse": mse_to_clean(X_corrected, X_clean),
-                "raw_corr": corr_to_clean(X_raw, X_clean),
-                "corr_corr": corr_to_clean(X_corrected, X_clean),
-            }
-        )
+    out["raw_batch_silhouette"] = pca_silhouette(X_raw, meta[batch_col].values, random_state=random_state)
+    out["corr_batch_silhouette"] = pca_silhouette(X_corr, meta[batch_col].values, random_state=random_state)
+    out.update(reconstruction_distortion(X_raw, X_corr, M))
+
     return out
 
 
-def score_metrics(metrics: dict[str, Any], config: ScoreConfig | None = None) -> float:
-    """Lower-is-better tuning score.
-
-    Same spirit as the notebook objective, but reusable for autoencoder and
-    baselines. Penalizes biology collapse and major MSE blow-up.
-    """
-    cfg = config or ScoreConfig()
-    if metrics["corr_cellline"] < cfg.min_cell_acc:
-        return cfg.bad_score
-    if "corr_mse" in metrics and "raw_mse" in metrics:
-        if metrics["corr_mse"] > metrics["raw_mse"] * cfg.mse_blowup_factor:
-            return cfg.bad_score
-        return float(metrics["corr_batch"] + cfg.clean_weight * metrics["corr_mse"])
-    return float(metrics["corr_batch"])
-
-
-def summarize_results(df: pd.DataFrame, group_col: str = "method") -> pd.DataFrame:
-    metric_cols = [c for c in df.columns if c not in {"seed", group_col, "config"} and pd.api.types.is_numeric_dtype(df[c])]
+def print_compact_results(results: list[dict]) -> None:
     rows = []
-    for method, g in df.groupby(group_col):
-        row = {group_col: method, "n": len(g)}
-        for c in metric_cols:
-            row[f"{c}_mean"] = g[c].mean()
-            row[f"{c}_std"] = g[c].std(ddof=1) if len(g) > 1 else 0.0
-        rows.append(row)
-    return pd.DataFrame(rows).sort_values(group_col).reset_index(drop=True)
+    for r in results:
+        rows.append({
+            "method": r.get("method"),
+            "batch_bacc": r.get("corr_batch_balanced_accuracy"),
+            "batch_acc": r.get("corr_batch_accuracy"),
+            "batch_chance": r.get("corr_batch_chance"),
+            "bio_bacc": r.get("corr_biology_balanced_accuracy"),
+            "bio_acc": r.get("corr_biology_accuracy"),
+            "batch_sil": r.get("corr_batch_silhouette"),
+            "bio_sil": r.get("corr_biology_silhouette"),
+            "rmse_change": r.get("observed_rmse_change"),
+        })
+    df = pd.DataFrame(rows)
+    with pd.option_context("display.max_columns", None, "display.width", 140):
+        print(df.to_string(index=False))

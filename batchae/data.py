@@ -1,175 +1,369 @@
-"""Synthetic proteomics data generator used in the original Colab cells."""
+"""Data loading and preprocessing for real proteomics batch-correction experiments.
+
+The main loader supports Ian's CyVerse layout:
+
+    <root>/<PXD...>/<sample or run>/search_results/protein.tsv
+
+Each protein.tsv is treated as one sample. The loader extracts one abundance
+column, e.g. "Razor intensity", pivots proteins into columns, and returns a
+sample x protein matrix plus metadata.
+
+The module also supports generic matrix + metadata input for other datasets.
+"""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import re
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
 
 
-def make_hard_proteomics(
-    n_samples: int = 180,
-    n_proteins: int = 1200,
-    n_batches: int = 6,
-    n_cell_lines: int = 3,
-    missing_rate: float = 0.20,
-    batch_effect_scale: float = 2.5,
-    biology_scale: float = 1.2,
-    noise_scale: float = 0.8,
-    confounding_strength: float = 0.65,
-    nonlinear_strength: float = 0.8,
-    drift_strength: float = 1.0,
-    outlier_frac: float = 0.04,
-    seed: int = 123,
-):
-    """Generate a hard synthetic proteomics batch-correction benchmark.
+DEFAULT_HEK293_PXDS = {
+    "PXD000115", "PXD000197", "PXD000520", "PXD001085", "PXD001281",
+    "PXD001468", "PXD001572", "PXD001828", "PXD001942", "PXD002070",
+}
+
+DEFAULT_HELA_PXDS = {
+    "PXD000381", "PXD000883", "PXD001061", "PXD001101", "PXD001374",
+    "PXD001660", "PXD001798", "PXD001805", "PXD002001", "PXD002039",
+}
+
+PROTEIN_ID_CANDIDATES = [
+    "Protein IDs",
+    "Protein.IDs",
+    "Majority protein IDs",
+    "Majority.protein.IDs",
+    "Leading razor protein",
+    "Leading.razor.protein",
+    "Protein ID",
+    "protein_id",
+    "protein",
+    "Protein",
+    "Accession",
+    "Entry",
+    "Protein.Group",
+    "Protein.Group.Accessions",
+]
+
+ABUNDANCE_CANDIDATES = [
+    "Razor intensity",
+    "Razor.Intensity",
+    "razor_intensity",
+    "RazorIntensity",
+    "Razor Intensity",
+    "Intensity",
+    "intensity",
+    "LFQ intensity",
+    "LFQ.intensity",
+    "Abundance",
+    "abundance",
+]
+
+
+@dataclass
+class ProteomicsDataset:
+    """Container returned by all loaders.
+
+    Attributes
+    ----------
+    X:
+        Preprocessed abundance matrix with shape n_samples x n_proteins.
+    M:
+        Missingness/observation mask with 1 for originally observed values and
+        0 for missing values, same shape as X.
+    meta:
+        Sample metadata. Must contain sample_id and usually batch/biology cols.
+    protein_ids:
+        Protein identifiers matching X columns.
+    raw_X:
+        Log-transformed but unimputed/unstandardized matrix with NaNs retained.
+    """
+
+    X: np.ndarray
+    M: np.ndarray
+    meta: pd.DataFrame
+    protein_ids: list[str]
+    raw_X: pd.DataFrame
+
+
+def _read_table(path: str | Path, sep: str | None = None) -> pd.DataFrame:
+    path = Path(path)
+    if sep is None:
+        if path.suffix.lower() in {".tsv", ".txt"}:
+            sep = "\t"
+        else:
+            sep = ","
+    return pd.read_csv(path, sep=sep, low_memory=False)
+
+
+def _normalize_col(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def detect_column(columns: Iterable[str], candidates: Iterable[str], requested: str | None = None) -> str:
+    """Find a column by exact or normalized name."""
+    columns = list(columns)
+    if requested:
+        if requested in columns:
+            return requested
+        req_norm = _normalize_col(requested)
+        for col in columns:
+            if _normalize_col(col) == req_norm:
+                return col
+        raise ValueError(f"Requested column {requested!r} was not found. Available columns: {columns[:30]}")
+
+    normalized = {_normalize_col(col): col for col in columns}
+    for cand in candidates:
+        cand_norm = _normalize_col(cand)
+        if cand_norm in normalized:
+            return normalized[cand_norm]
+
+    raise ValueError(
+        "Could not auto-detect a required column. "
+        f"Tried candidates={list(candidates)}. Available columns start with: {columns[:30]}"
+    )
+
+
+def extract_pxd_id(path: str | Path) -> str:
+    match = re.search(r"PXD\d{6}", str(path), flags=re.IGNORECASE)
+    return match.group(0).upper() if match else "UNKNOWN_PXD"
+
+
+def family_from_pxd(pxd: str) -> str:
+    pxd = str(pxd).upper()
+    if pxd in DEFAULT_HEK293_PXDS:
+        return "HEK293"
+    if pxd in DEFAULT_HELA_PXDS:
+        return "HeLa"
+    return "unknown"
+
+
+def discover_protein_tsvs(root: str | Path, pattern: str = "**/search_results/protein.tsv") -> list[Path]:
+    root = Path(root)
+    files = sorted(root.glob(pattern))
+    if not files:
+        # Fallback for slightly different layouts.
+        files = sorted(root.glob("**/protein.tsv"))
+    if not files:
+        raise FileNotFoundError(f"No protein.tsv files found under {root} using pattern {pattern!r}")
+    return files
+
+
+def _unique_sample_ids(ids: list[str]) -> list[str]:
+    counts: dict[str, int] = {}
+    out: list[str] = []
+    for sample_id in ids:
+        sample_id = str(sample_id)
+        if sample_id not in counts:
+            counts[sample_id] = 0
+            out.append(sample_id)
+        else:
+            counts[sample_id] += 1
+            out.append(f"{sample_id}__dup{counts[sample_id]}")
+    return out
+
+
+def load_protein_tsv_directory(
+    root: str | Path,
+    abundance_col: str | None = None,
+    protein_id_col: str | None = None,
+    pattern: str = "**/search_results/protein.tsv",
+    zero_as_missing: bool = True,
+    duplicate_policy: str = "max",
+    metadata_path: str | Path | None = None,
+    metadata_sample_col: str = "sample_id",
+    metadata_batch_col: str | None = None,
+    metadata_biology_col: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load recursive protein.tsv files into a samples x proteins DataFrame.
 
     Returns
     -------
-    X_filled : np.ndarray, shape (n_samples, n_proteins)
-        Observed data with missing values mean-imputed protein-wise.
-    M : np.ndarray, shape (n_samples, n_proteins)
-        Observed/missing mask, where 1 means observed.
-    meta : pd.DataFrame
-        sample_id, batch, cell_line, run_order, sample_quality, is_outlier.
-    protein_ids : list[str]
-        Protein names.
-    X_clean : np.ndarray
-        Ground-truth biology without batch effects/noise.
+    abundance_df:
+        Samples x proteins, with NaNs for missing proteins.
+    meta:
+        Metadata with sample_id, path, dataset_id, batch, and biology columns.
     """
+    files = discover_protein_tsvs(root, pattern=pattern)
 
-    rng = np.random.default_rng(seed)
+    sample_ids: list[str] = []
+    rows: list[pd.Series] = []
+    meta_rows: list[dict[str, str]] = []
 
-    batch_sizes = rng.multinomial(n_samples, rng.dirichlet(np.ones(n_batches) * 1.5))
-    while np.any(batch_sizes < 8):
-        batch_sizes = rng.multinomial(n_samples, rng.dirichlet(np.ones(n_batches) * 1.5))
+    for file_path in files:
+        df = _read_table(file_path, sep="\t")
+        pid_col = detect_column(df.columns, PROTEIN_ID_CANDIDATES, protein_id_col)
+        val_col = detect_column(df.columns, ABUNDANCE_CANDIDATES, abundance_col)
 
-    batch_labels = np.concatenate([np.full(sz, b, dtype=int) for b, sz in enumerate(batch_sizes)])
-    rng.shuffle(batch_labels)
+        small = df[[pid_col, val_col]].copy()
+        small[pid_col] = small[pid_col].astype(str).str.strip()
+        small = small[small[pid_col].notna() & (small[pid_col] != "") & (small[pid_col].str.lower() != "nan")]
+        small[val_col] = pd.to_numeric(small[val_col], errors="coerce")
 
-    cell_line_labels = np.zeros(n_samples, dtype=int)
-    batch_dominant_cl = rng.integers(0, n_cell_lines, size=n_batches)
+        if zero_as_missing:
+            small.loc[small[val_col] <= 0, val_col] = np.nan
 
-    for i in range(n_samples):
-        b = batch_labels[i]
-        if rng.random() < confounding_strength:
-            cell_line_labels[i] = batch_dominant_cl[b]
+        if duplicate_policy == "max":
+            series = small.groupby(pid_col, sort=False)[val_col].max()
+        elif duplicate_policy == "sum":
+            series = small.groupby(pid_col, sort=False)[val_col].sum(min_count=1)
+        elif duplicate_policy == "mean":
+            series = small.groupby(pid_col, sort=False)[val_col].mean()
         else:
-            cell_line_labels[i] = rng.integers(0, n_cell_lines)
+            raise ValueError("duplicate_policy must be one of: max, sum, mean")
 
-    protein_base = rng.normal(14.0, 1.7, size=n_proteins)
-    low_abundance = rng.choice(n_proteins, size=n_proteins // 5, replace=False)
-    protein_base[low_abundance] -= rng.uniform(2.0, 4.0, size=len(low_abundance))
+        # Usually sample folder is the directory above search_results.
+        sample_folder = file_path.parent.parent.name if file_path.parent.name == "search_results" else file_path.parent.name
+        pxd = extract_pxd_id(file_path)
+        sample_id = f"{pxd}__{sample_folder}"
 
-    cell_line_effects = np.zeros((n_cell_lines, n_proteins))
-    for cl in range(n_cell_lines):
-        active = rng.choice(n_proteins, size=n_proteins // 6, replace=False)
-        cell_line_effects[cl, active] = rng.normal(0, biology_scale, size=len(active))
+        sample_ids.append(sample_id)
+        rows.append(series)
+        meta_rows.append({
+            "sample_id": sample_id,
+            "path": str(file_path),
+            "dataset_id": pxd,
+            "batch": pxd,
+            "biology": family_from_pxd(pxd),
+        })
 
-    n_bio_modules = 5
-    bio_modules = rng.normal(0, 1, size=(n_bio_modules, n_proteins))
-    bio_loadings = rng.normal(0, biology_scale * 0.5, size=(n_cell_lines, n_bio_modules))
-    cell_line_effects += bio_loadings @ bio_modules
+    sample_ids = _unique_sample_ids(sample_ids)
+    abundance_df = pd.DataFrame(rows, index=sample_ids)
+    abundance_df.index.name = "sample_id"
 
-    n_batch_factors = 5
-    batch_factors = rng.normal(0, 1, size=(n_batch_factors, n_proteins))
-    batch_loadings = rng.normal(0, batch_effect_scale, size=(n_batches, n_batch_factors))
-    additive_batch_effects = batch_loadings @ batch_factors
+    meta = pd.DataFrame(meta_rows)
+    meta["sample_id"] = sample_ids
 
-    batch_scale = rng.lognormal(mean=0.0, sigma=0.18, size=(n_batches, n_proteins))
-    nonlinear_batch = rng.normal(0, nonlinear_strength, size=(n_batches, n_proteins))
+    if metadata_path:
+        user_meta = _read_table(metadata_path)
+        if metadata_sample_col not in user_meta.columns:
+            raise ValueError(f"metadata_sample_col={metadata_sample_col!r} not in metadata file")
+        meta = meta.merge(user_meta, left_on="sample_id", right_on=metadata_sample_col, how="left", suffixes=("", "_user"))
+        if metadata_batch_col:
+            meta["batch"] = meta[metadata_batch_col].astype(str)
+        if metadata_biology_col:
+            meta["biology"] = meta[metadata_biology_col].astype(str)
 
-    run_order = np.zeros(n_samples)
-    for b in range(n_batches):
-        idx = np.where(batch_labels == b)[0]
-        order = np.linspace(-1, 1, len(idx))
-        rng.shuffle(order)
-        run_order[idx] = order
+    return abundance_df, meta
 
-    drift_direction = rng.normal(0, 1, size=n_proteins)
 
-    true_X_clean = np.zeros((n_samples, n_proteins))
-    X_observed = np.zeros((n_samples, n_proteins))
-    sample_quality = rng.lognormal(mean=0.0, sigma=0.20, size=n_samples)
+def load_matrix_with_metadata(
+    matrix_path: str | Path,
+    metadata_path: str | Path,
+    sample_col: str = "sample_id",
+    batch_col: str = "batch",
+    biology_col: str = "biology",
+    sep: str | None = None,
+    orientation: str = "samples_rows",
+    zero_as_missing: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load a generic abundance matrix and sample metadata.
 
-    for i in range(n_samples):
-        cl = cell_line_labels[i]
-        b = batch_labels[i]
+    matrix orientation:
+    - samples_rows: first column/index is sample id; columns are proteins.
+    - proteins_rows: first column/index is protein id; columns are samples.
+    """
+    matrix = _read_table(matrix_path, sep=sep)
+    first_col = matrix.columns[0]
+    matrix = matrix.set_index(first_col)
 
-        clean = protein_base + cell_line_effects[cl]
-        true_X_clean[i] = clean
+    if orientation not in {"samples_rows", "proteins_rows"}:
+        raise ValueError("orientation must be 'samples_rows' or 'proteins_rows'")
+    if orientation == "proteins_rows":
+        matrix = matrix.T
 
-        centered_clean = clean - clean.mean()
-        additive = additive_batch_effects[b]
-        multiplicative = batch_scale[b] * centered_clean
-        nonlinear = nonlinear_batch[b] * np.tanh(centered_clean / 2.0)
-        drift = drift_strength * run_order[i] * drift_direction
-        noise = rng.normal(0, noise_scale * sample_quality[i], size=n_proteins)
+    matrix.index = matrix.index.astype(str)
+    matrix = matrix.apply(pd.to_numeric, errors="coerce")
+    if zero_as_missing:
+        matrix = matrix.mask(matrix <= 0)
 
-        X_observed[i] = (
-            protein_base
-            + multiplicative
-            + cell_line_effects[cl]
-            + additive
-            + nonlinear
-            + drift
-            + noise
-        )
+    meta = _read_table(metadata_path)
+    required = [sample_col, batch_col]
+    for col in required:
+        if col not in meta.columns:
+            raise ValueError(f"Required metadata column {col!r} missing from {metadata_path}")
+    if biology_col not in meta.columns:
+        meta[biology_col] = "unknown"
 
-    n_outliers = max(1, int(outlier_frac * n_samples))
-    outlier_samples = rng.choice(n_samples, size=n_outliers, replace=False)
+    meta = meta.copy()
+    meta["sample_id"] = meta[sample_col].astype(str)
+    meta["batch"] = meta[batch_col].astype(str)
+    meta["biology"] = meta[biology_col].astype(str)
+    meta = meta.set_index("sample_id").loc[matrix.index].reset_index()
 
-    for i in outlier_samples:
-        affected = rng.choice(n_proteins, size=max(1, n_proteins // 8), replace=False)
-        X_observed[i, affected] += rng.normal(0, 5.0, size=len(affected))
+    return matrix, meta
 
-    abundance_term = 1 / (1 + np.exp((protein_base - np.median(protein_base)) / 1.2))
-    protein_missing_bias = rng.beta(2, 8, size=n_proteins)
-    batch_missing_bias = rng.normal(0, 0.12, size=(n_batches, n_proteins))
 
-    sample_missing_bias = sample_quality - sample_quality.min()
-    sample_missing_bias = sample_missing_bias / (sample_missing_bias.max() + 1e-8)
+def preprocess_abundance_matrix(
+    abundance_df: pd.DataFrame,
+    meta: pd.DataFrame,
+    min_present_frac: float = 0.2,
+    max_missing_frac: float | None = None,
+    log2_transform: bool = True,
+    impute_strategy: str = "median",
+    standardize: bool = True,
+    drop_unknown_biology: bool = False,
+    biology_col: str = "biology",
+) -> ProteomicsDataset:
+    """Filter, transform, impute, and optionally standardize abundance matrix."""
+    abundance_df = abundance_df.copy()
+    meta = meta.copy()
 
-    miss_prob = np.zeros((n_samples, n_proteins))
-    for i in range(n_samples):
-        b = batch_labels[i]
-        logits = (
-            -2.2
-            + 2.2 * abundance_term
-            + 1.5 * protein_missing_bias
-            + batch_missing_bias[b]
-            + 0.8 * sample_missing_bias[i]
-        )
-        p = 1 / (1 + np.exp(-logits))
-        p = missing_rate * p / p.mean()
-        miss_prob[i] = np.clip(p, 0.01, 0.75)
+    if drop_unknown_biology and biology_col in meta.columns:
+        keep_samples = ~meta[biology_col].astype(str).str.lower().isin({"unknown", "nan", "", "none"})
+        meta = meta.loc[keep_samples].reset_index(drop=True)
+        abundance_df = abundance_df.loc[meta["sample_id"].values]
 
-    M = (rng.random(size=(n_samples, n_proteins)) > miss_prob).astype(np.float32)
+    present = abundance_df.notna().mean(axis=0)
+    keep = present >= float(min_present_frac)
+    if max_missing_frac is not None:
+        keep &= (1.0 - present) <= float(max_missing_frac)
+    abundance_df = abundance_df.loc[:, keep]
 
-    X_filled = X_observed.copy()
-    for j in range(n_proteins):
-        obs_mask = M[:, j].astype(bool)
-        if obs_mask.sum() > 0:
-            X_filled[~obs_mask, j] = X_observed[obs_mask, j].mean()
-        else:
-            X_filled[:, j] = protein_base[j]
+    if abundance_df.shape[1] == 0:
+        raise ValueError("No proteins remain after filtering. Lower --min-present-frac.")
 
-    meta = pd.DataFrame(
-        {
-            "sample_id": [f"S{i:03d}" for i in range(n_samples)],
-            "batch": batch_labels,
-            "cell_line": cell_line_labels,
-            "run_order": run_order,
-            "sample_quality": sample_quality,
-            "is_outlier": np.isin(np.arange(n_samples), outlier_samples).astype(int),
-        }
+    raw = abundance_df.astype(float)
+    if log2_transform:
+        raw = np.log2(raw + 1.0)
+
+    M = raw.notna().astype(np.float32).values
+
+    if impute_strategy == "median":
+        fill_values = raw.median(axis=0)
+    elif impute_strategy == "mean":
+        fill_values = raw.mean(axis=0)
+    elif impute_strategy == "zero":
+        fill_values = pd.Series(0.0, index=raw.columns)
+    else:
+        raise ValueError("impute_strategy must be one of: median, mean, zero")
+
+    X_df = raw.fillna(fill_values)
+    # Proteins that are all NaN after filtering are unlikely but possible.
+    X_df = X_df.fillna(0.0)
+
+    if standardize:
+        means = X_df.mean(axis=0)
+        stds = X_df.std(axis=0, ddof=0).replace(0, 1.0)
+        X_df = (X_df - means) / stds
+
+    return ProteomicsDataset(
+        X=X_df.values.astype(np.float32),
+        M=M.astype(np.float32),
+        meta=meta.reset_index(drop=True),
+        protein_ids=[str(c) for c in X_df.columns],
+        raw_X=raw,
     )
 
-    protein_ids = [f"PROT_{j:04d}" for j in range(n_proteins)]
 
-    return (
-        X_filled.astype(np.float32),
-        M.astype(np.float32),
-        meta,
-        protein_ids,
-        true_X_clean.astype(np.float32),
-    )
+def assert_experiment_ready(meta: pd.DataFrame, batch_col: str, biology_col: str | None = None) -> None:
+    if batch_col not in meta.columns:
+        raise ValueError(f"Batch column {batch_col!r} not found in metadata")
+    if meta[batch_col].nunique() < 2:
+        raise ValueError("Need at least two batch classes for batch-correction evaluation")
+    if biology_col and biology_col in meta.columns and meta[biology_col].nunique() < 2:
+        print(f"WARNING: biology column {biology_col!r} has <2 classes; biology preservation metrics will be skipped.")

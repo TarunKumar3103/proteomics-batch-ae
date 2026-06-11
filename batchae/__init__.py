@@ -1,10 +1,3 @@
-"""Proteomics batch-correction autoencoder experiment package."""
+"""Batch correction autoencoder package for real proteomics datasets."""
 
-__all__ = [
-    "data",
-    "model",
-    "training",
-    "metrics",
-    "baselines",
-    "threading",
-]
+__version__ = "0.2.0"
