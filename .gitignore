@@ -12,3 +12,4 @@ results/*
 *.pt
 *.pth
 *.pkl
+*.egg-info/

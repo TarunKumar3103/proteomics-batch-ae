@@ -91,13 +91,31 @@ class ProteomicsDataset:
 
 
 def _read_table(path: str | Path, sep: str | None = None) -> pd.DataFrame:
+    """Robust table reader for CyVerse/Data Store mounted files."""
+    import time
+
     path = Path(path)
     if sep is None:
-        if path.suffix.lower() in {".tsv", ".txt"}:
-            sep = "\t"
-        else:
-            sep = ","
-    return pd.read_csv(path, sep=sep, low_memory=False)
+        sep = "	" if path.suffix.lower() in {".tsv", ".txt"} else ","
+
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            return pd.read_csv(path, sep=sep, low_memory=False)
+        except Exception as e:
+            last_error = e
+            try:
+                return pd.read_csv(
+                    path,
+                    sep=sep,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
+            except Exception as e2:
+                last_error = e2
+                time.sleep(0.5 * attempt)
+
+    raise RuntimeError(f"Failed to read table after retries: {path}. Last error: {last_error}")
 
 
 def _normalize_col(name: str) -> str:
@@ -142,14 +160,58 @@ def family_from_pxd(pxd: str) -> str:
     return "unknown"
 
 
-def discover_protein_tsvs(root: str | Path, pattern: str = "**/search_results/protein.tsv") -> list[Path]:
+def discover_protein_tsvs(root: str | Path, pattern: str = "**/search_results/*/protein.tsv") -> list[Path]:
+    """Find protein.tsv files with visible progress on CyVerse mounts."""
+    import subprocess
+
     root = Path(root)
-    files = sorted(root.glob(pattern))
+    if not root.exists():
+        raise FileNotFoundError(f"Data root does not exist: {root}")
+
+    print(f"[discover] Searching under: {root}", flush=True)
+
+    cmd = [
+        "find",
+        str(root),
+        "-type",
+        "f",
+        "-name",
+        "protein.tsv",
+    ]
+
+    files: list[Path] = []
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+
+    assert proc.stdout is not None
+
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Keep the intended layout first:
+        # .../search_results/<sample_id>/protein.tsv
+        if "/search_results/" in line:
+            files.append(Path(line))
+            if len(files) == 1 or len(files) % 25 == 0:
+                print(f"[discover] Found {len(files)} protein.tsv files so far...", flush=True)
+
+    rc = proc.wait()
+    if rc != 0:
+        print(f"[discover] Warning: find exited with code {rc}", flush=True)
+
+    files = sorted(files)
+
     if not files:
-        # Fallback for slightly different layouts.
-        files = sorted(root.glob("**/protein.tsv"))
-    if not files:
-        raise FileNotFoundError(f"No protein.tsv files found under {root} using pattern {pattern!r}")
+        raise FileNotFoundError(f"No protein.tsv files found under {root}")
+
+    print(f"[discover] Finished. Found {len(files)} protein.tsv files.", flush=True)
     return files
 
 
@@ -171,13 +233,15 @@ def load_protein_tsv_directory(
     root: str | Path,
     abundance_col: str | None = None,
     protein_id_col: str | None = None,
-    pattern: str = "**/search_results/protein.tsv",
+    pattern: str = "**/search_results/*/protein.tsv",
     zero_as_missing: bool = True,
     duplicate_policy: str = "max",
     metadata_path: str | Path | None = None,
     metadata_sample_col: str = "sample_id",
     metadata_batch_col: str | None = None,
     metadata_biology_col: str | None = None,
+    verbose: bool = True,
+    progress_every: int = 50,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load recursive protein.tsv files into a samples x proteins DataFrame.
 
@@ -190,14 +254,30 @@ def load_protein_tsv_directory(
     """
     files = discover_protein_tsvs(root, pattern=pattern)
 
+    if verbose:
+        print(f"[load] Found {len(files)} protein.tsv files under {root}", flush=True)
+        print(f"[load] Pattern used: {pattern}", flush=True)
+
     sample_ids: list[str] = []
     rows: list[pd.Series] = []
     meta_rows: list[dict[str, str]] = []
 
-    for file_path in files:
-        df = _read_table(file_path, sep="\t")
-        pid_col = detect_column(df.columns, PROTEIN_ID_CANDIDATES, protein_id_col)
-        val_col = detect_column(df.columns, ABUNDANCE_CANDIDATES, abundance_col)
+    for i, file_path in enumerate(files, start=1):
+        if verbose and (i == 1 or i % progress_every == 0 or i == len(files)):
+            print(f"[load] Reading {i}/{len(files)}: {file_path}", flush=True)
+
+        try:
+            df = _read_table(file_path, sep="\t")
+        except Exception as e:
+            raise RuntimeError(f"Failed reading {file_path}: {e}") from e
+        try:
+            pid_col = detect_column(df.columns, PROTEIN_ID_CANDIDATES, protein_id_col)
+            val_col = detect_column(df.columns, ABUNDANCE_CANDIDATES, abundance_col)
+        except Exception as e:
+            raise RuntimeError(
+                f"Column detection failed for {file_path}. "
+                f"Available columns: {list(df.columns)[:40]}. Original error: {e}"
+            ) from e
 
         small = df[[pid_col, val_col]].copy()
         small[pid_col] = small[pid_col].astype(str).str.strip()
