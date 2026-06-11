@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+results/*
+!results/.gitkeep
+*.egg-info/
+.DS_Store
