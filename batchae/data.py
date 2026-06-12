@@ -2,7 +2,7 @@
 
 The main loader supports Ian's CyVerse layout:
 
-    <root>/<PXD...>/<sample or run>/search_results/protein.tsv
+    <root>/<PXD...>/pipeline_run/<run_id>/search_results/<sample_id>/protein.tsv
 
 Each protein.tsv is treated as one sample. The loader extracts one abundance
 column, e.g. "Razor intensity", pivots proteins into columns, and returns a
@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import re
+import subprocess
 from typing import Iterable, Optional
 
 import numpy as np
@@ -91,31 +93,13 @@ class ProteomicsDataset:
 
 
 def _read_table(path: str | Path, sep: str | None = None) -> pd.DataFrame:
-    """Robust table reader for CyVerse/Data Store mounted files."""
-    import time
-
     path = Path(path)
     if sep is None:
-        sep = "	" if path.suffix.lower() in {".tsv", ".txt"} else ","
-
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            return pd.read_csv(path, sep=sep, low_memory=False)
-        except Exception as e:
-            last_error = e
-            try:
-                return pd.read_csv(
-                    path,
-                    sep=sep,
-                    engine="python",
-                    on_bad_lines="skip",
-                )
-            except Exception as e2:
-                last_error = e2
-                time.sleep(0.5 * attempt)
-
-    raise RuntimeError(f"Failed to read table after retries: {path}. Last error: {last_error}")
+        if path.suffix.lower() in {".tsv", ".txt"}:
+            sep = "\t"
+        else:
+            sep = ","
+    return pd.read_csv(path, sep=sep, low_memory=False)
 
 
 def _normalize_col(name: str) -> str:
@@ -160,58 +144,93 @@ def family_from_pxd(pxd: str) -> str:
     return "unknown"
 
 
-def discover_protein_tsvs(root: str | Path, pattern: str = "**/search_results/*/protein.tsv") -> list[Path]:
-    """Find protein.tsv files with visible progress on CyVerse mounts."""
-    import subprocess
+def _read_manifest_paths(manifest: str | Path) -> list[Path]:
+    """Read a newline-delimited manifest of protein.tsv paths."""
+    manifest = Path(manifest).expanduser()
+    if not manifest.is_file():
+        return []
 
-    root = Path(root)
-    if not root.exists():
-        raise FileNotFoundError(f"Data root does not exist: {root}")
+    files: list[Path] = []
+    for line in manifest.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line).expanduser()
+        if p.is_file():
+            files.append(p)
+    return sorted(files)
 
-    print(f"[discover] Searching under: {root}", flush=True)
 
+def _discover_with_find(root: Path, progress_every: int = 25) -> list[Path]:
+    """Fast Unix find-based discovery for slow mounted filesystems such as CyVerse."""
     cmd = [
         "find",
         str(root),
+        "-maxdepth",
+        "6",
         "-type",
         "f",
-        "-name",
-        "protein.tsv",
+        "-path",
+        "*/search_results/*/protein.tsv",
     ]
+    print(f"[discover] Searching under: {root}", flush=True)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return []
 
     files: list[Path] = []
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-
     assert proc.stdout is not None
-
     for line in proc.stdout:
         line = line.strip()
         if not line:
             continue
+        files.append(Path(line))
+        if len(files) == 1 or len(files) % progress_every == 0:
+            print(f"[discover] Found {len(files)} protein.tsv files so far...", flush=True)
 
-        # Keep the intended layout first:
-        # .../search_results/<sample_id>/protein.tsv
-        if "/search_results/" in line:
-            files.append(Path(line))
-            if len(files) == 1 or len(files) % 25 == 0:
-                print(f"[discover] Found {len(files)} protein.tsv files so far...", flush=True)
-
+    stderr = proc.stderr.read() if proc.stderr is not None else ""
     rc = proc.wait()
     if rc != 0:
-        print(f"[discover] Warning: find exited with code {rc}", flush=True)
-
-    files = sorted(files)
-
-    if not files:
-        raise FileNotFoundError(f"No protein.tsv files found under {root}")
+        print(f"WARNING: find returned exit code {rc}: {stderr.strip()}", flush=True)
+        return []
 
     print(f"[discover] Finished. Found {len(files)} protein.tsv files.", flush=True)
+    return sorted(files)
+
+
+def discover_protein_tsvs(
+    root: str | Path,
+    pattern: str = "**/search_results/*/protein.tsv",
+    progress_every: int = 25,
+) -> list[Path]:
+    """Discover protein.tsv files, honoring PROTEIN_TSV_MANIFEST when set.
+
+    The manifest avoids repeated slow recursive directory walks on CyVerse.
+    Expected manifest format: one absolute protein.tsv path per line.
+    """
+    manifest = os.environ.get("PROTEIN_TSV_MANIFEST")
+    if manifest:
+        files = _read_manifest_paths(manifest)
+        if files:
+            print(f"[discover] Reading manifest: {manifest}", flush=True)
+            print(f"[discover] Loaded {len(files)} protein.tsv paths from manifest.", flush=True)
+            return files
+        print(f"WARNING: PROTEIN_TSV_MANIFEST={manifest!r} had no readable files; falling back to discovery.", flush=True)
+
+    root = Path(root)
+
+    # Use Unix find first because pathlib recursive glob can be very slow on
+    # mounted data-store filesystems. Fall back to glob for non-Unix platforms.
+    files = _discover_with_find(root, progress_every=progress_every)
+    if not files:
+        files = sorted(root.glob(pattern))
+    if not files and pattern != "**/protein.tsv":
+        # Last-resort fallback for slightly different layouts.
+        files = sorted(root.glob("**/protein.tsv"))
+
+    if not files:
+        raise FileNotFoundError(f"No protein.tsv files found under {root} using pattern {pattern!r}")
     return files
 
 
@@ -234,14 +253,13 @@ def load_protein_tsv_directory(
     abundance_col: str | None = None,
     protein_id_col: str | None = None,
     pattern: str = "**/search_results/*/protein.tsv",
+    progress_every: int = 25,
     zero_as_missing: bool = True,
     duplicate_policy: str = "max",
     metadata_path: str | Path | None = None,
     metadata_sample_col: str = "sample_id",
     metadata_batch_col: str | None = None,
     metadata_biology_col: str | None = None,
-    verbose: bool = True,
-    progress_every: int = 50,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load recursive protein.tsv files into a samples x proteins DataFrame.
 
@@ -252,32 +270,20 @@ def load_protein_tsv_directory(
     meta:
         Metadata with sample_id, path, dataset_id, batch, and biology columns.
     """
-    files = discover_protein_tsvs(root, pattern=pattern)
-
-    if verbose:
-        print(f"[load] Found {len(files)} protein.tsv files under {root}", flush=True)
-        print(f"[load] Pattern used: {pattern}", flush=True)
+    files = discover_protein_tsvs(root, pattern=pattern, progress_every=progress_every)
+    print(f"[load] Found {len(files)} protein.tsv files under {root}", flush=True)
+    print(f"[load] Pattern used: {pattern}", flush=True)
 
     sample_ids: list[str] = []
     rows: list[pd.Series] = []
     meta_rows: list[dict[str, str]] = []
 
     for i, file_path in enumerate(files, start=1):
-        if verbose and (i == 1 or i % progress_every == 0 or i == len(files)):
+        if i == 1 or i == len(files) or i % max(1, progress_every) == 0:
             print(f"[load] Reading {i}/{len(files)}: {file_path}", flush=True)
-
-        try:
-            df = _read_table(file_path, sep="\t")
-        except Exception as e:
-            raise RuntimeError(f"Failed reading {file_path}: {e}") from e
-        try:
-            pid_col = detect_column(df.columns, PROTEIN_ID_CANDIDATES, protein_id_col)
-            val_col = detect_column(df.columns, ABUNDANCE_CANDIDATES, abundance_col)
-        except Exception as e:
-            raise RuntimeError(
-                f"Column detection failed for {file_path}. "
-                f"Available columns: {list(df.columns)[:40]}. Original error: {e}"
-            ) from e
+        df = _read_table(file_path, sep="\t")
+        pid_col = detect_column(df.columns, PROTEIN_ID_CANDIDATES, protein_id_col)
+        val_col = detect_column(df.columns, ABUNDANCE_CANDIDATES, abundance_col)
 
         small = df[[pid_col, val_col]].copy()
         small[pid_col] = small[pid_col].astype(str).str.strip()

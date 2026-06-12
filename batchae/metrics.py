@@ -14,7 +14,7 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, silhouette_score
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 
@@ -26,8 +26,19 @@ def _safe_cv(labels, requested_cv: int = 5) -> int:
     return max(0, min(int(requested_cv), int(counts.min())))
 
 
-def classifier_scores(X: np.ndarray, labels, cv: int = 5, n_jobs: int = 1, random_state: int = 42) -> dict:
-    """Cross-validated linear classifier accuracy and balanced accuracy."""
+def classifier_scores(
+    X: np.ndarray,
+    labels,
+    cv: int = 5,
+    n_jobs: int = 1,
+    random_state: int = 42,
+    max_iter: int = 10000,
+) -> dict:
+    """Cross-validated linear classifier accuracy and balanced accuracy.
+
+    Uses one cross-validation prediction pass and computes both metrics from the
+    same held-out predictions. This avoids fitting the same classifier twice.
+    """
     labels = np.asarray(labels).astype(str)
     le = LabelEncoder()
     y = le.fit_transform(labels)
@@ -37,7 +48,9 @@ def classifier_scores(X: np.ndarray, labels, cv: int = 5, n_jobs: int = 1, rando
     if n_classes < 2 or cv_eff < 2:
         return {
             "accuracy": np.nan,
+            "accuracy_std": np.nan,
             "balanced_accuracy": np.nan,
+            "balanced_accuracy_std": np.nan,
             "chance": np.nan,
             "majority_baseline": np.nan,
             "n_classes": n_classes,
@@ -45,23 +58,71 @@ def classifier_scores(X: np.ndarray, labels, cv: int = 5, n_jobs: int = 1, rando
         }
 
     Xs = StandardScaler().fit_transform(X)
-    clf = LogisticRegression(max_iter=5000, solver="lbfgs", n_jobs=None, random_state=random_state)
+    clf = LogisticRegression(max_iter=max_iter, solver="lbfgs", n_jobs=None, random_state=random_state)
     splitter = StratifiedKFold(n_splits=cv_eff, shuffle=True, random_state=random_state)
 
-    acc = cross_val_score(clf, Xs, y, cv=splitter, scoring="accuracy", n_jobs=n_jobs)
-    bacc = cross_val_score(clf, Xs, y, cv=splitter, scoring="balanced_accuracy", n_jobs=n_jobs)
+    y_pred = cross_val_predict(clf, Xs, y, cv=splitter, n_jobs=n_jobs)
+
+    # Fold-level values are useful for rough variability/debugging. The headline
+    # metric is the global held-out prediction score above.
+    acc_fold = []
+    bacc_fold = []
+    for _, test_idx in splitter.split(Xs, y):
+        acc_fold.append(accuracy_score(y[test_idx], y_pred[test_idx]))
+        bacc_fold.append(balanced_accuracy_score(y[test_idx], y_pred[test_idx]))
 
     counts = np.bincount(y)
     return {
-        "accuracy": float(np.mean(acc)),
-        "accuracy_std": float(np.std(acc)),
-        "balanced_accuracy": float(np.mean(bacc)),
-        "balanced_accuracy_std": float(np.std(bacc)),
+        "accuracy": float(accuracy_score(y, y_pred)),
+        "accuracy_std": float(np.std(acc_fold)),
+        "balanced_accuracy": float(balanced_accuracy_score(y, y_pred)),
+        "balanced_accuracy_std": float(np.std(bacc_fold)),
         "chance": float(1.0 / n_classes),
         "majority_baseline": float(counts.max() / counts.sum()),
         "n_classes": n_classes,
         "cv": cv_eff,
     }
+
+
+def classifier_scores_fast(X: np.ndarray, labels, cv: int = 5, n_jobs: int = 1, random_state: int = 42) -> dict:
+    """Cheaper classifier probe for Optuna's inner loop.
+
+    It uses fewer optimizer iterations than the final reporting metric. The
+    objective only needs a stable ranking signal; final metrics still call
+    classifier_scores with the higher default max_iter.
+    """
+    return classifier_scores(
+        X,
+        labels,
+        cv=cv,
+        n_jobs=n_jobs,
+        random_state=random_state,
+        max_iter=2000,
+    )
+
+
+def constrained_batch_floor(batch_labels, biology_labels) -> float:
+    """Expected batch-bAcc floor when biology is preserved but batch is erased within biology.
+
+    If biology perfectly partitions the batches, a biology-preserving correction
+    can still reveal which biology family a sample belongs to. The best possible
+    within-family batch mixing therefore has an expected recall of 1/k for each
+    batch, where k is the number of batch classes inside that biology family.
+    """
+    batch = np.asarray(batch_labels).astype(str)
+    biology = np.asarray(biology_labels).astype(str)
+    if len(batch) != len(biology) or len(np.unique(batch)) == 0:
+        return np.nan
+
+    floors = []
+    for b in np.unique(batch):
+        fams = np.unique(biology[batch == b])
+        if len(fams) != 1:
+            return np.nan
+        fam = fams[0]
+        n_batches_in_family = len(np.unique(batch[biology == fam]))
+        floors.append(1.0 / max(n_batches_in_family, 1))
+    return float(np.mean(floors))
 
 
 def reconstruction_distortion(X_raw: np.ndarray, X_corr: np.ndarray, M: np.ndarray) -> dict:

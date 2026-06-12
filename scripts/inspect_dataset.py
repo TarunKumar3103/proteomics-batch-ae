@@ -29,8 +29,6 @@ def parse_args():
     p.add_argument("--abundance-col", default=None)
     p.add_argument("--min-present-frac", type=float, default=0.2)
     p.add_argument("--drop-unknown-biology", action="store_true")
-    p.add_argument("--progress-every", type=int, default=25, help="Print progress every N protein.tsv files.")
-    p.add_argument("--quiet-load", action="store_true", help="Disable per-file loading progress.")
     return p.parse_args()
 
 
@@ -56,8 +54,6 @@ def main():
             abundance_col=args.abundance_col,
             protein_id_col=args.protein_id_col,
             metadata_path=args.metadata,
-            verbose=not args.quiet_load,
-            progress_every=args.progress_every,
         )
 
     ds = preprocess_abundance_matrix(

@@ -140,9 +140,24 @@ class ProteomicsBatchAE(nn.Module):
         X_corr, _ = self.decode(z_corr, cov_corr)
         return X_corr, mu
 
-    def init_weights_svd(self, X_centered: np.ndarray) -> None:
-        """Initialize encoder/decoder with PCA-like directions for stability."""
-        U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+    def init_weights_svd(
+        self,
+        X_centered: np.ndarray | None = None,
+        svd_cache: dict[str, np.ndarray] | None = None,
+    ) -> None:
+        """Initialize encoder/decoder with PCA-like directions for stability.
+
+        Pass svd_cache={"S": S, "Vt": Vt} to avoid recomputing SVD for every
+        Optuna trial on the same data matrix.
+        """
+        if svd_cache is not None:
+            S = svd_cache["S"]
+            Vt = svd_cache["Vt"]
+        else:
+            if X_centered is None:
+                raise ValueError("Either X_centered or svd_cache must be provided")
+            _, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+
         k = min(self.latent_dim, Vt.shape[0])
 
         with torch.no_grad():

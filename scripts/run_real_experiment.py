@@ -26,7 +26,13 @@ from batchae.data import (
     load_protein_tsv_directory,
     preprocess_abundance_matrix,
 )
-from batchae.metrics import classifier_scores, evaluate_correction, print_compact_results
+from batchae.metrics import (
+    classifier_scores,
+    classifier_scores_fast,
+    constrained_batch_floor,
+    evaluate_correction,
+    print_compact_results,
+)
 from batchae.model import ProteomicsBatchAE
 from batchae.threading import configure_threads
 from batchae.training import build_torch_dataset, correct_with_model, train_model
@@ -38,7 +44,7 @@ def parse_args():
     # Input options
     p.add_argument("--data-root", default="/iplant/home/shared/NCEMS/PPA/TestDatasets",
                    help="Root containing recursive search_results/protein.tsv files.")
-    p.add_argument("--pattern", default="**/search_results/protein.tsv")
+    p.add_argument("--pattern", default="**/search_results/*/protein.tsv")
     p.add_argument("--matrix", default=None, help="Optional generic abundance matrix path.")
     p.add_argument("--metadata", default=None, help="Optional metadata CSV/TSV path.")
     p.add_argument("--orientation", choices=["samples_rows", "proteins_rows"], default="samples_rows")
@@ -139,7 +145,7 @@ def load_dataset_from_args(args):
     return ds
 
 
-def make_model(trial, ds, encoded, args):
+def make_model(trial, ds, encoded, args, svd_cache=None):
     batch_dim = trial.suggest_int("batch_dim", 4, 14)
     biology_dim = trial.suggest_int("biology_dim", 2, 10)
     extra_dim = trial.suggest_int("extra_dim", 8, 32)
@@ -157,11 +163,14 @@ def make_model(trial, ds, encoded, args):
         hidden_classifier_dim=hidden_classifier_dim,
         variational=False,
     )
-    model.init_weights_svd(ds.X - ds.X.mean(axis=0, keepdims=True))
+    if svd_cache is None:
+        model.init_weights_svd(ds.X - ds.X.mean(axis=0, keepdims=True))
+    else:
+        model.init_weights_svd(svd_cache=svd_cache)
     return model
 
 
-def objective_factory(ds, encoded, args, device, raw_batch_bacc, raw_bio_bacc):
+def objective_factory(ds, encoded, args, device, raw_batch_bacc, raw_bio_bacc, svd_cache):
     def objective(trial):
         set_seed(args.seed + trial.number)
         hparams = {
@@ -171,7 +180,7 @@ def objective_factory(ds, encoded, args, device, raw_batch_bacc, raw_bio_bacc):
             "eta_adv": trial.suggest_float("eta_adv", 0.05, 25.0, log=True),
             "gamma_indep": trial.suggest_float("gamma_indep", 0.001, 1.0, log=True),
         }
-        model = make_model(trial, ds, encoded, args).to(device)
+        model = make_model(trial, ds, encoded, args, svd_cache=svd_cache).to(device)
         train_model(
             model,
             encoded,
@@ -185,7 +194,7 @@ def objective_factory(ds, encoded, args, device, raw_batch_bacc, raw_bio_bacc):
         )
         X_corr, _ = correct_with_model(model, ds.X, ds.M, encoded, device=device)
 
-        batch_scores = classifier_scores(
+        batch_scores = classifier_scores_fast(
             X_corr,
             ds.meta[args.batch_col].values,
             cv=5,
@@ -197,7 +206,7 @@ def objective_factory(ds, encoded, args, device, raw_batch_bacc, raw_bio_bacc):
         # Penalize biology collapse if biology labels are available.
         bio_penalty = 0.0
         if args.biology_col in ds.meta.columns and ds.meta[args.biology_col].nunique() >= 2:
-            bio_scores = classifier_scores(
+            bio_scores = classifier_scores_fast(
                 X_corr,
                 ds.meta[args.biology_col].values,
                 cv=5,
@@ -239,6 +248,10 @@ def main():
     ds = load_dataset_from_args(args)
     encoded = build_torch_dataset(ds.X, ds.M, ds.meta, args.batch_col, args.biology_col)
 
+    print("[svd] Computing SVD cache once for all AE trials...", flush=True)
+    _, svd_s, svd_vt = np.linalg.svd(ds.X - ds.X.mean(axis=0, keepdims=True), full_matrices=False)
+    svd_cache = {"S": svd_s, "Vt": svd_vt}
+
     print(f"X shape: {ds.X.shape}")
     print(f"Missing rate: {1.0 - ds.M.mean():.1%}")
     print(f"Batches ({len(encoded.batch_classes)}): {encoded.batch_classes}")
@@ -256,6 +269,10 @@ def main():
     if args.biology_col in ds.meta.columns and ds.meta[args.biology_col].nunique() >= 2:
         raw_bio = classifier_scores(ds.X, ds.meta[args.biology_col].values, cv=5, n_jobs=args.sklearn_jobs, random_state=args.seed)
     print(f"Raw batch balanced accuracy:   {raw_batch['balanced_accuracy']:.3f} | chance={raw_batch['chance']:.3f}")
+    if args.biology_col in ds.meta.columns and ds.meta[args.biology_col].nunique() >= 2:
+        floor = constrained_batch_floor(ds.meta[args.batch_col].values, ds.meta[args.biology_col].values)
+        if not np.isnan(floor):
+            print(f"Constrained batch-bAcc floor if biology is preserved: {floor:.3f}")
     if not np.isnan(raw_bio["balanced_accuracy"]):
         print(f"Raw biology balanced accuracy: {raw_bio['balanced_accuracy']:.3f}")
 
@@ -280,7 +297,8 @@ def main():
     print_compact_results(all_results)
 
     print("\n=== Tuning adversarial autoencoder ===")
-    study = optuna.create_study(direction="minimize")
+    sampler = optuna.samplers.TPESampler(seed=args.seed)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
     objective = objective_factory(
         ds,
         encoded,
@@ -288,6 +306,7 @@ def main():
         device,
         raw_batch_bacc=raw_batch["balanced_accuracy"],
         raw_bio_bacc=raw_bio["balanced_accuracy"],
+        svd_cache=svd_cache,
     )
     start = time.time()
     study.optimize(objective, n_trials=args.ae_trials, n_jobs=args.optuna_jobs, show_progress_bar=True)
@@ -303,7 +322,7 @@ def main():
 
     print("\n=== Training final AE ===")
     fixed = optuna.trial.FixedTrial(study.best_params)
-    final_model = make_model(fixed, ds, encoded, args).to(device)
+    final_model = make_model(fixed, ds, encoded, args, svd_cache=svd_cache).to(device)
     hparams = {
         "lambda_missing": study.best_params["lambda_missing"],
         "eta_batch": study.best_params["eta_batch"],
