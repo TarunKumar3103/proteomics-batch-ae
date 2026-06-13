@@ -291,6 +291,154 @@ def heldout_baseline_grid(
     return results, matrices
 
 
+
+def _covariates_from_meta(meta: pd.DataFrame, batch_classes: list[str], biology_classes: list[str], batch_col: str, biology_col: str | None) -> tuple[np.ndarray, int]:
+    """Build batch+biology one-hot covariates using fixed train-fold class order."""
+    n = len(meta)
+    batch_vals = meta[batch_col].astype(str).to_numpy()
+    batch_oh = np.column_stack([(batch_vals == c).astype(np.float32) for c in batch_classes])
+    if biology_col and biology_col in meta.columns and biology_classes:
+        bio_vals = meta[biology_col].astype(str).to_numpy()
+        bio_oh = np.column_stack([(bio_vals == c).astype(np.float32) for c in biology_classes])
+    else:
+        bio_oh = np.zeros((n, 0), dtype=np.float32)
+    return np.concatenate([batch_oh, bio_oh], axis=1).astype(np.float32), len(batch_classes)
+
+
+def _ae_correct_matrix(model, X: np.ndarray, M: np.ndarray, meta: pd.DataFrame, encoded_train, batch_col: str, biology_col: str | None, device: str) -> tuple[np.ndarray, np.ndarray]:
+    """Correct arbitrary rows with an AE trained on a fold, using train-fold label encodings."""
+    import torch
+
+    cov, batch_cov_dim = _covariates_from_meta(
+        meta,
+        batch_classes=encoded_train.batch_classes,
+        biology_classes=encoded_train.biology_classes,
+        batch_col=batch_col,
+        biology_col=biology_col,
+    )
+    model = model.to(device)
+    model.eval()
+    with torch.no_grad():
+        X_t = torch.tensor(np.asarray(X, dtype=np.float32), dtype=torch.float32, device=device)
+        M_t = torch.tensor(np.asarray(M, dtype=np.float32), dtype=torch.float32, device=device)
+        cov_t = torch.tensor(cov, dtype=torch.float32, device=device)
+        X_corr, z = model.correct(X_t, M_t, cov_t, batch_cov_dim=batch_cov_dim)
+    return X_corr.detach().cpu().numpy(), z.detach().cpu().numpy()
+
+
+def evaluate_ae_heldout(
+    ds,
+    make_model_fn: Callable,
+    hparams: dict,
+    batch_col: str,
+    biology_col: str | None = None,
+    cv: int = 5,
+    random_state: int = 42,
+    n_epochs: int = 300,
+    lr: float = 1e-4,
+    batch_size: int = 32,
+    device: str = "cpu",
+    dataloader_workers: int = 0,
+    max_iter: int = 10000,
+    verbose: bool = False,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    """Leakage-safe held-out evaluation for the AE.
+
+    For each outer fold, this trains a fresh AE only on train rows, corrects the
+    held-out test rows, then trains probe classifiers on corrected train rows and
+    predicts corrected held-out rows. The pooled predictions give a true
+    out-of-fold estimate for the selected AE operating point.
+
+    Parameters
+    ----------
+    make_model_fn:
+        Callable with signature ``make_model_fn(encoded_train, X_train, M_train,
+        meta_train, fold) -> torch.nn.Module``. The function should construct
+        and initialize a new AE for that fold.
+    """
+    from batchae.training import build_torch_dataset, train_model
+
+    X = np.asarray(ds.X, dtype=np.float32)
+    M = np.asarray(ds.M, dtype=np.float32)
+    meta = ds.meta.reset_index(drop=True)
+    y_batch = meta[batch_col].astype(str).to_numpy()
+    y_bio = meta[biology_col].astype(str).to_numpy() if biology_col and biology_col in meta.columns else None
+    cv_eff = _safe_outer_cv(y_batch, cv)
+    if cv_eff < 2:
+        raise ValueError(f"Not enough samples per batch for cv={cv}")
+
+    splitter = StratifiedKFold(n_splits=cv_eff, shuffle=True, random_state=random_state)
+    X_oof = np.empty_like(X, dtype=np.float32)
+    z_oof = None
+    batch_pred = np.empty(len(meta), dtype=object)
+    bio_pred = np.empty(len(meta), dtype=object) if y_bio is not None else None
+
+    for fold, (train_idx, test_idx) in enumerate(splitter.split(X, y_batch), start=1):
+        print(f"[heldout-ae] Fold {fold}/{cv_eff}: training AE on {len(train_idx)} rows, correcting {len(test_idx)} held-out rows...", flush=True)
+        meta_train = meta.iloc[train_idx].reset_index(drop=True)
+        meta_test = meta.iloc[test_idx].reset_index(drop=True)
+        encoded_train = build_torch_dataset(X[train_idx], M[train_idx], meta_train, batch_col, biology_col)
+        model = make_model_fn(encoded_train, X[train_idx], M[train_idx], meta_train, fold)
+        train_model(
+            model,
+            encoded_train,
+            hparams,
+            n_epochs=n_epochs,
+            lr=lr,
+            batch_size=batch_size,
+            device=device,
+            dataloader_workers=dataloader_workers,
+            verbose=verbose,
+        )
+        X_train_corr, _ = _ae_correct_matrix(model, X[train_idx], M[train_idx], meta_train, encoded_train, batch_col, biology_col, device)
+        X_test_corr, z_test = _ae_correct_matrix(model, X[test_idx], M[test_idx], meta_test, encoded_train, batch_col, biology_col, device)
+        X_oof[test_idx] = X_test_corr
+        if z_oof is None:
+            z_oof = np.zeros((len(meta), z_test.shape[1]), dtype=np.float32)
+        z_oof[test_idx] = z_test.astype(np.float32)
+
+        batch_pred[test_idx] = _probe_train_predict(
+            X_train_corr,
+            y_batch[train_idx],
+            X_test_corr,
+            random_state=random_state + fold,
+            max_iter=max_iter,
+        )
+        if bio_pred is not None and len(np.unique(y_bio[train_idx])) >= 2:
+            bio_pred[test_idx] = _probe_train_predict(
+                X_train_corr,
+                y_bio[train_idx],
+                X_test_corr,
+                random_state=random_state + 1000 + fold,
+                max_iter=max_iter,
+            )
+
+    batch_classes = np.unique(y_batch)
+    result = {
+        "method": "adversarial_ae_heldout",
+        "evaluation_protocol": "heldout_ae_correction_and_probe",
+        "batch_bacc": float(balanced_accuracy_score(y_batch, batch_pred)),
+        "batch_acc": float(accuracy_score(y_batch, batch_pred)),
+        "batch_chance": float(1.0 / len(batch_classes)),
+        "batch_cv": cv_eff,
+    }
+    if y_bio is not None and len(np.unique(y_bio)) >= 2:
+        result.update({
+            "bio_bacc": float(balanced_accuracy_score(y_bio, bio_pred)),
+            "bio_acc": float(accuracy_score(y_bio, bio_pred)),
+            "bio_chance": float(1.0 / len(np.unique(y_bio))),
+            "constrained_batch_floor": constrained_batch_floor(y_batch, y_bio),
+        })
+    else:
+        result.update({
+            "bio_bacc": np.nan,
+            "bio_acc": np.nan,
+            "bio_chance": np.nan,
+            "constrained_batch_floor": np.nan,
+        })
+    result.update(reconstruction_distortion(ds.X, X_oof, ds.M))
+    return result, X_oof, z_oof if z_oof is not None else np.empty((len(meta), 0), dtype=np.float32)
+
 def flag_result(row: dict, tolerance: float = 0.02) -> str:
     """Flag impossible/suspicious rows so they are not accidentally reported."""
     batch_bacc = row.get("batch_bacc", np.nan)
